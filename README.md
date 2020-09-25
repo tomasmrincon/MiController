@@ -1,6 +1,12 @@
 # MiController
 Converts the Xiaomi Mi Controller into an Xbox Controller.
 
+Instructions
+============
+- Pair your Xioami Mi Controller to your computer
+- Install MiControllerSetup.exe
+- Right click on he new system tray icon with the Mi logo and click Connect
+
 Download
 ========
 https://github.com/tomasmrincon/MiController/releases/download/v1.0/MiControllerSetup.exe
