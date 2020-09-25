@@ -1,6 +1,12 @@
 # MiController
-Converts the Xiaomi Mi Controller into an Xbox Controller
+Converts the Xiaomi Mi Controller into an Xbox Controller.
 
+Download
+========
+https://github.com/tomasmrincon/MiController/releases/download/v1.0/MiControllerSetup.exe
+
+Credits
+=======
 Full credits and thanks to:
  - Xiaomi Gamepad to Xbox 360 controller Mapper: https://github.com/irungentoo/Xiaomi_gamepad/releases
  - ScpToolkit: https://github.com/nefarius/ScpToolkit
