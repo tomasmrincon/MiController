@@ -38,16 +38,15 @@ Source: ".\bin\Release\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
 Source: ".\bin\Release\ScpDriver\*"; DestDir: "{app}\ScpDriver"; Flags: ignoreversion recursesubdirs createallsubdirs
 ; NOTE: Don't use "Flags: ignoreversion" on any shared system files
 
-[Registry]
-Root: HKLM; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "{#MyAppName}"; ValueData: "{app}\{#MyAppExeName}"
-Root: HKLM; Subkey: "Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "{#MyAppName}"; ValueData: "{app}\{#MyAppExeName}"
 
 [Icons]
 Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
 
 [Run]
+Filename: schtasks; Parameters: "/Create /SC ONLOGON /TN ""{#MyAppName}"" /TR ""{app}\{#MyAppExeName}"" /RL HIGHEST" ; Flags: nowait
 Filename: "{app}\{#MyAppExeName}"; Parameters: "/install"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait skipifsilent
 
 [UninstallRun]
 Filename: "{app}\{#MyAppExeName}"; Parameters: "/uninstall"; 
+Filename: schtasks; Parameters: "/Delete /TN ""{#MyAppName}"" /F "
