@@ -1,200 +1,309 @@
 ﻿using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using HidLibrary;
-using ScpDriverInterface;
-using System.Threading;
-using System.Runtime.InteropServices;
-
+using Nefarius.ViGEm.Client;
+using Nefarius.ViGEm.Client.Exceptions;
+using Nefarius.ViGEm.Client.Targets;
+using Nefarius.ViGEm.Client.Targets.Xbox360;
 
 namespace MiController
 {
-    public class XiaomiGamepad
+    public class XiaomiGamepad : IDisposable
     {
-        private byte[] Vibration = { 0x20, 0x00, 0x00 };
-        private Mutex rumble_mutex = new Mutex();
+        private static readonly Xbox360Button[][] HatSwitches = {
+            new [] { Xbox360Button.Up },
+            new [] { Xbox360Button.Up, Xbox360Button.Right },
+            new [] { Xbox360Button.Right },
+            new [] { Xbox360Button.Right, Xbox360Button.Down },
+            new [] { Xbox360Button.Down },
+            new [] { Xbox360Button.Down, Xbox360Button.Left },
+            new [] { Xbox360Button.Left },
+            new [] { Xbox360Button.Left, Xbox360Button.Up },
+        };
 
-        public XiaomiGamepad(HidDevice Device, ScpBus scpBus, int index)
+        public event EventHandler Started;
+        public event EventHandler Ended;
+
+        private readonly IXbox360Controller _target;
+        private readonly Thread _inputThread;
+        private readonly CancellationTokenSource _cts;
+        private readonly Timer _vibrationTimer;
+        private static readonly IHidEnumerator DeviceEnumerator = new HidFastReadEnumerator();
+
+        public XiaomiGamepad(string device, string instance, ViGEmClient client)
         {
-            Device.WriteFeatureData(Vibration);
+            Device = DeviceEnumerator.GetDevice(device) as HidFastReadDevice;
+            if (Device != null)
+            {
+                Device.MonitorDeviceEvents = false;
+            }
 
-            Thread rThread = new Thread(() => rumble_thread(Device));
-            // rThread.Priority = ThreadPriority.BelowNormal; 
-            rThread.Start();
+            _target = client.CreateXbox360Controller();
+            _target.AutoSubmitReport = false;
+            _target.FeedbackReceived += Target_OnFeedbackReceived;
 
-            Thread iThread = new Thread(() => input_thread(Device, scpBus, index));
-            iThread.Priority = ThreadPriority.Highest;
-            iThread.Start();
+            // TODO mark the threads as background?
+            _inputThread = new Thread(DeviceWorker);
+
+            _cts = new CancellationTokenSource();
+            _vibrationTimer = new Timer(VibrationTimer_Trigger);
+
+            LedNumber = 0xFF;
+            InstanceId = instance;
         }
 
-        private void rumble_thread(HidDevice Device)
+        public HidFastReadDevice Device { get; }
+
+        public ushort LedNumber { get;  set; }
+
+        public ushort BatteryLevel { get; private set; }
+
+        public bool IsActive => _inputThread.IsAlive;
+        public bool CleanEnd => _cts.IsCancellationRequested;
+
+        public bool ExclusiveMode { get; private set; }
+
+        public string InstanceId { get; }
+
+        public void Dispose()
         {
-            byte[] local_vibration = { 0x20, 0x00, 0x00 };
-            while (true)
+            // De-initializing XiaomiGamepad handler for device
+            if (_inputThread.IsAlive)
+                Stop();
+
+            Device.Dispose();
+            _cts.Dispose();
+        }
+
+        public void Start()
+        {
+            _inputThread.Start();
+        }
+
+        public void Stop()
+        {
+            if (_cts.IsCancellationRequested)
             {
-                rumble_mutex.WaitOne();
-                if (local_vibration[2] != Vibration[2] || Vibration[1] != local_vibration[1])
+                // Thread stop for device already requested
+                return;
+            }
+
+            // Requesting thread stop for device
+            _cts.Cancel();
+            _inputThread.Join();
+        }
+
+        private void DeviceWorker()
+        {
+            // Starting worker thread for device
+
+            // Open HID device to read input from the gamepad
+            Device.OpenDevice(DeviceMode.Overlapped, DeviceMode.Overlapped, ShareMode.Exclusive);
+            ExclusiveMode = true;
+
+            // If exclusive mode is not available, retry in shared mode.
+            if (!Device.IsOpen)
+            {
+                // Cannot access HID device in exclusive mode, retrying in shared mode
+
+                Device.OpenDevice(DeviceMode.Overlapped, DeviceMode.Overlapped, ShareMode.ShareRead | ShareMode.ShareWrite);
+                ExclusiveMode = false;
+
+                if (!Device.IsOpen)
                 {
-                    local_vibration[2] = Vibration[2];
-                    local_vibration[1] = Vibration[1];
-                    rumble_mutex.ReleaseMutex();
-                    Device.WriteFeatureData(local_vibration);
-                    //Console.WriteLine("Big Motor: {0}, Small Motor: {1}", Vibration[2], Vibration[1]);
+                    // Cannot open HID device
+                    Device.CloseDevice();
+                    Ended?.Invoke(this, EventArgs.Empty);
+                    return;
                 }
-                else
+            }
+
+            // Init Xiaomi Gamepad vibration
+            Device.WriteFeatureData(new byte[] { 0x20, 0x00, 0x00 });
+
+            // Connect the virtual Xbox360 gamepad
+            try
+            {
+                // Connecting to ViGEm client
+                _target.Connect();
+            }
+            catch (VigemAlreadyConnectedException)
+            {
+                // ViGEm client was already opened, closing and reopening it
+                _target.Disconnect();
+                _target.Connect();
+            }
+
+            Started?.Invoke(this, EventArgs.Empty);
+
+            var token = _cts.Token;
+
+            while (!token.IsCancellationRequested)
+            {
+                // Is device has been closed, exit the loop
+                if (!Device.IsOpen)
+                    break;
+
+                // Otherwise read a report
+                var hidReport = Device.FastReadReport(1000);
+
+                if (hidReport.ReadStatus == HidDeviceData.ReadStatus.WaitTimedOut)
+                    continue;
+                if (hidReport.ReadStatus != HidDeviceData.ReadStatus.Success)
                 {
-                    rumble_mutex.ReleaseMutex();
+                    // Cannot read HID report for device
+                    break;
                 }
-                Thread.Sleep(20);
+
+                var data = hidReport.Data;
+
+                /*
+                [0]  Buttons state, 1 bit per button
+                [1]  Buttons state, 1 bit per button
+                [2]  0x00
+                [3]  D-Pad
+                [4]  Left thumb, X axis
+                [5]  Left thumb, Y axis
+                [6]  Right thumb, X axis
+                [7]  Right thumb, Y axis
+                [8]  0x00
+                [9]  0x00
+                [10] L trigger
+                [11] R trigger
+                [12] Accelerometer axis 1
+                [13] Accelerometer axis 1
+                [14] Accelerometer axis 2
+                [15] Accelerometer axis 2
+                [16] Accelerometer axis 3
+                [17] Accelerometer axis 3
+                [18] Battery level
+                [19] MI button
+                    */
+
+                lock (_target)
+                {
+                    _target.SetButtonState(Xbox360Button.A, GetBit(data[0], 0));
+                    _target.SetButtonState(Xbox360Button.B, GetBit(data[0], 1));
+                    _target.SetButtonState(Xbox360Button.X, GetBit(data[0], 3));
+                    _target.SetButtonState(Xbox360Button.Y, GetBit(data[0], 4));
+                    _target.SetButtonState(Xbox360Button.LeftShoulder, GetBit(data[0], 6));
+                    _target.SetButtonState(Xbox360Button.RightShoulder, GetBit(data[0], 7));
+
+                    _target.SetButtonState(Xbox360Button.Back, GetBit(data[1], 2));
+                    _target.SetButtonState(Xbox360Button.Start, GetBit(data[1], 3));
+                    _target.SetButtonState(Xbox360Button.LeftThumb, GetBit(data[1], 5));
+                    _target.SetButtonState(Xbox360Button.RightThumb, GetBit(data[1], 6));
+
+                    // Reset Hat switch status, as is set to 15 (all directions set, impossible state)
+                    _target.SetButtonState(Xbox360Button.Up, false);
+                    _target.SetButtonState(Xbox360Button.Left, false);
+                    _target.SetButtonState(Xbox360Button.Down, false);
+                    _target.SetButtonState(Xbox360Button.Right, false);
+
+                    if (data[3] < 8)
+                    {
+                        var btns = HatSwitches[data[3]];
+                        // Hat Switch is a number from 0 to 7, where 0 is Up, 1 is Up-Left, etc.
+                        foreach (var b in btns)
+                            _target.SetButtonState(b, true);
+                    }
+
+                    // Analog axis
+                    _target.SetAxisValue(Xbox360Axis.LeftThumbX, MapAnalog(data[4]));
+                    _target.SetAxisValue(Xbox360Axis.LeftThumbY, MapAnalog(data[5], true));
+                    _target.SetAxisValue(Xbox360Axis.RightThumbX, MapAnalog(data[6]));
+                    _target.SetAxisValue(Xbox360Axis.RightThumbY, MapAnalog(data[7], true));
+
+                    // Triggers
+                    _target.SetSliderValue(Xbox360Slider.LeftTrigger, data[10]);
+                    _target.SetSliderValue(Xbox360Slider.RightTrigger, data[11]);
+
+                    // Logo ("home") button
+                    if (GetBit(data[19], 0))
+                    {
+                        _target.SetButtonState(Xbox360Button.Guide, true);
+                        Task.Delay(200, token).ContinueWith(DelayedReleaseGuideButton);
+                    }
+
+                    // Update battery level
+                    BatteryLevel = data[18];
+
+                    _target.SubmitReport();
+                }
+
+            }
+
+            // Disconnect the virtual Xbox360 gamepad
+            // Let Dispose handle that, otherwise it will rise a NotPluggedIn exception
+            // Disconnecting ViGEm client
+            _target.Disconnect();
+
+            // Close the HID device
+            // Closing HID device
+            Device.CloseDevice();
+
+            // Exiting worker thread for device
+            Ended?.Invoke(this, EventArgs.Empty);
+        }
+
+        private static bool GetBit(byte b, int bit)
+        {
+            return ((b >> bit) & 1) != 0;
+        }
+
+        private static short MapAnalog(byte value, bool invert = false)
+        {
+            return (short)(value * 257 * (invert ? -1 : 1) + short.MinValue);
+        }
+
+        private void DelayedReleaseGuideButton(Task t)
+        {
+            lock (_target)
+            {
+                _target.SetButtonState(Xbox360Button.Guide, false);
+                _target.SubmitReport();
             }
         }
 
-        private void input_thread(HidDevice Device, ScpBus scpBus, int index)
+        private void VibrationTimer_Trigger(object o)
         {
-            scpBus.PlugIn(index);
-            X360Controller controller = new X360Controller();
-            int timeout = 30;
-            long last_changed = 0;
-            long last_mi_button = 0;
-            while (true)
+            Task.Run(() => {
+                lock (_vibrationTimer)
+                {
+                    if (Device.IsOpen)
+                        Device.WriteFeatureData(new byte[] { 0x20, 0x00, 0x00 });
+
+                    // Vibration feedback reset after 3 seconds for device
+                }
+            });
+        }
+
+        private void Target_OnFeedbackReceived(object sender, Xbox360FeedbackReceivedEventArgs e)
+        {
+            byte[] data = { 0x20, e.SmallMotor, e.LargeMotor };
+
+            Task.Run(() => {
+
+                lock (_vibrationTimer)
+                {
+                    if (!Device.IsOpen)
+                        return;
+
+                    Device.WriteFeatureData(data);
+                }
+
+                var timeout = e.SmallMotor > 0 || e.LargeMotor > 0 ? 3000 : Timeout.Infinite;
+                _vibrationTimer.Change(timeout, Timeout.Infinite);
+
+            });
+
+            if (LedNumber != e.LedNumber)
             {
-                HidDeviceData data = Device.Read(timeout);
-                var currentState = data.Data;
-                bool changed = false;
-                if (data.Status == HidDeviceData.ReadStatus.Success && currentState.Length >= 21 && currentState[0] == 4)
-                {
-                    //Console.WriteLine(Program.ByteArrayToHexString(currentState));
-                    X360Buttons Buttons = X360Buttons.None;
-                    if ((currentState[1] & 1) != 0) Buttons |= X360Buttons.A;
-                    if ((currentState[1] & 2) != 0) Buttons |= X360Buttons.B;
-                    if ((currentState[1] & 8) != 0) Buttons |= X360Buttons.X;
-                    if ((currentState[1] & 16) != 0) Buttons |= X360Buttons.Y;
-                    if ((currentState[1] & 64) != 0) Buttons |= X360Buttons.LeftBumper;
-                    if ((currentState[1] & 128) != 0) Buttons |= X360Buttons.RightBumper;
-
-                    if ((currentState[2] & 32) != 0) Buttons |= X360Buttons.LeftStick;
-                    if ((currentState[2] & 64) != 0) Buttons |= X360Buttons.RightStick;
-
-                    if (currentState[4] != 15)
-                    {
-                        if (currentState[4] == 0 || currentState[4] == 1 || currentState[4] == 7) Buttons |= X360Buttons.Up;
-                        if (currentState[4] == 4 || currentState[4] == 3 || currentState[4] == 5) Buttons |= X360Buttons.Down;
-                        if (currentState[4] == 6 || currentState[4] == 5 || currentState[4] == 7) Buttons |= X360Buttons.Left;
-                        if (currentState[4] == 2 || currentState[4] == 1 || currentState[4] == 3) Buttons |= X360Buttons.Right;
-                    }
-
-                    if ((currentState[2] & 8) != 0) Buttons |= X360Buttons.Start;
-                    if ((currentState[2] & 4) != 0) Buttons |= X360Buttons.Back;
-
-
-
-                    if ((currentState[20] & 1) != 0)
-                    {
-                        last_mi_button = (DateTime.Now.Ticks / TimeSpan.TicksPerMillisecond);
-                        Buttons |= X360Buttons.Logo;
-                    }
-                    if (last_mi_button != 0) Buttons |= X360Buttons.Logo;
-
-
-                    if (controller.Buttons != Buttons)
-                    {
-                        changed = true;
-                        controller.Buttons = Buttons;
-                    }
-
-                    short LeftStickX = (short)((Math.Max(-127.0, currentState[5] - 128) / 127) * 32767);
-                    if (LeftStickX == -32767)
-                        LeftStickX = -32768;
-
-                    if (LeftStickX != controller.LeftStickX)
-                    {
-                        changed = true;
-                        controller.LeftStickX = LeftStickX;
-                    }
-
-                    short LeftStickY = (short)((Math.Max(-127.0, currentState[6] - 128) / 127) * -32767);
-                    if (LeftStickY == -32767)
-                        LeftStickY = -32768;
-
-                    if (LeftStickY != controller.LeftStickY)
-                    {
-                        changed = true;
-                        controller.LeftStickY = LeftStickY;
-                    }
-
-                    short RightStickX = (short)((Math.Max(-127.0, currentState[7] - 128) / 127) * 32767);
-                    if (RightStickX == -32767)
-                        RightStickX = -32768;
-
-                    if (RightStickX != controller.RightStickX)
-                    {
-                        changed = true;
-                        controller.RightStickX = RightStickX;
-                    }
-
-                    short RightStickY = (short)((Math.Max(-127.0, currentState[8] - 128) / 127) * -32767);
-                    if (RightStickY == -32767)
-                        RightStickY = -32768;
-
-                    if (RightStickY != controller.RightStickY)
-                    {
-                        changed = true;
-                        controller.RightStickY = RightStickY;
-                    }
-
-                    if (controller.LeftTrigger != currentState[11])
-                    {
-                        changed = true;
-                        controller.LeftTrigger = currentState[11];
-                    }
-
-                    if (controller.RightTrigger != currentState[12])
-                    {
-                        changed = true;
-                        controller.RightTrigger = currentState[12];
-
-                    }
-                }
-
-                if (data.Status == HidDeviceData.ReadStatus.WaitTimedOut || (!changed && ((last_changed + timeout) < (DateTime.Now.Ticks / TimeSpan.TicksPerMillisecond))))
-                {
-                    changed = true;
-                }
-
-                if (changed)
-                {
-                    //Console.WriteLine("changed");
-                    //Console.WriteLine((DateTime.Now.Ticks / TimeSpan.TicksPerMillisecond));
-                    byte[] outputReport = new byte[8];
-                    scpBus.Report(index, controller.GetReport(), outputReport);
-
-                    if (outputReport[1] == 0x08)
-                    {
-                        byte bigMotor = outputReport[3];
-                        byte smallMotor = outputReport[4];
-                        rumble_mutex.WaitOne();
-                        if (bigMotor != Vibration[2] || Vibration[1] != smallMotor)
-                        {
-                            Vibration[1] = smallMotor;
-                            Vibration[2] = bigMotor;
-                        }
-                        rumble_mutex.ReleaseMutex();
-                    }
-
-                    if (last_mi_button != 0)
-                    {
-                        if ((last_mi_button + 100) < (DateTime.Now.Ticks / TimeSpan.TicksPerMillisecond))
-                        {
-                            last_mi_button = 0;
-                            controller.Buttons ^= X360Buttons.Logo;
-                        }
-                    }
-
-                    last_changed = DateTime.Now.Ticks / TimeSpan.TicksPerMillisecond;
-                }
+                LedNumber = e.LedNumber;
+                // TODO raise event here
             }
         }
+
     }
 }

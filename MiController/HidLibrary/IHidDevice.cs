@@ -34,7 +34,7 @@ namespace HidLibrary
         bool IsConnected { get; }
         string Description { get; }
         HidDeviceCapabilities Capabilities { get; }
-        HidDeviceAttributes Attributes { get;  }
+        HidDeviceAttributes Attributes { get; }
         string DevicePath { get; }
 
         bool MonitorDeviceEvents { get; set; }
@@ -42,7 +42,7 @@ namespace HidLibrary
         void OpenDevice();
 
         void OpenDevice(DeviceMode readMode, DeviceMode writeMode, ShareMode shareMode);
-        
+
         void CloseDevice();
 
         HidDeviceData Read();

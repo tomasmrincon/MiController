@@ -2,7 +2,7 @@
 ; SEE THE DOCUMENTATION FOR DETAILS ON CREATING INNO SETUP SCRIPT FILES!
 
 #define MyAppName "Mi Controller"
-#define MyAppVersion "1.0"
+#define MyAppVersion "1.1"
 #define MyAppPublisher "TomaSoft"
 #define MyAppExeName "MiController.exe"
 
@@ -35,7 +35,6 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 
 [Files]
 Source: ".\bin\Release\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
-Source: ".\bin\Release\ScpDriver\*"; DestDir: "{app}\ScpDriver"; Flags: ignoreversion recursesubdirs createallsubdirs
 ; NOTE: Don't use "Flags: ignoreversion" on any shared system files
 
 
@@ -45,8 +44,6 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: de
 
 [Run]
 Filename: schtasks; Parameters: "/Create /SC ONLOGON /TN ""{#MyAppName}"" /TR ""{app}\{#MyAppExeName}"" /RL HIGHEST" ; Flags: nowait
-Filename: "{app}\{#MyAppExeName}"; Parameters: "/install"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait skipifsilent
 
 [UninstallRun]
-Filename: "{app}\{#MyAppExeName}"; Parameters: "/uninstall"; 
 Filename: schtasks; Parameters: "/Delete /TN ""{#MyAppName}"" /F "

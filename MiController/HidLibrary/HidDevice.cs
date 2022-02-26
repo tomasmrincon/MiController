@@ -27,10 +27,6 @@ namespace HidLibrary
         private delegate bool WriteDelegate(byte[] data, int timeout);
         private delegate bool WriteReportDelegate(HidReport report, int timeout);
 
-        private NativeOverlapped read_overlapped;
-        private byte[] read_buffer;
-        private bool reading;
-
         internal HidDevice(string devicePath, string description = null)
         {
             _deviceEventMonitor = new HidDeviceEventMonitor(this);
@@ -106,10 +102,6 @@ namespace HidLibrary
             }
 
             IsOpen = Handle.ToInt32() != NativeMethods.INVALID_HANDLE_VALUE;
-            if (!IsOpen)
-            {
-                throw new Exception("Error opening HID device.");
-            }
         }
 
 
@@ -127,7 +119,9 @@ namespace HidLibrary
 
         public HidDeviceData Read(int timeout)
         {
-                if (IsOpen == false) return new HidDeviceData(HidDeviceData.ReadStatus.ReadError);
+            if (IsConnected)
+            {
+                if (IsOpen == false) OpenDevice(_deviceReadMode, _deviceWriteMode, _deviceShareMode);
                 try
                 {
                     return ReadData(timeout);
@@ -136,6 +130,9 @@ namespace HidLibrary
                 {
                     return new HidDeviceData(HidDeviceData.ReadStatus.ReadError);
                 }
+
+            }
+            return new HidDeviceData(HidDeviceData.ReadStatus.NotConnected);
         }
 
         public void Read(ReadCallback callback)
@@ -182,6 +179,22 @@ namespace HidLibrary
         {
             var readReportDelegate = new ReadReportDelegate(ReadReport);
             return await Task<HidReport>.Factory.FromAsync(readReportDelegate.BeginInvoke, readReportDelegate.EndInvoke, timeout, null);
+        }
+
+        /// <summary>
+        /// Reads an input report from the Control channel.  This method provides access to report data for devices that 
+        /// do not use the interrupt channel to communicate for specific usages.
+        /// </summary>
+        /// <param name="reportId">The report ID to read from the device</param>
+        /// <returns>The HID report that is read.  The report will contain the success status of the read request</returns>
+        /// 
+        public HidReport ReadReportSync(byte reportId)
+        {
+            byte[] cmdBuffer = new byte[Capabilities.InputReportByteLength];
+            cmdBuffer[0] = reportId;
+            bool bSuccess = NativeMethods.HidD_GetInputReport(Handle, cmdBuffer, cmdBuffer.Length);
+            HidDeviceData deviceData = new HidDeviceData(cmdBuffer, bSuccess ? HidDeviceData.ReadStatus.Success : HidDeviceData.ReadStatus.NoDataRead);
+            return new HidReport(Capabilities.InputReportByteLength, deviceData);
         }
 
         public bool ReadFeatureData(out byte[] data, byte reportId = 0)
@@ -314,6 +327,8 @@ namespace HidLibrary
 
         public bool Write(byte[] data, int timeout)
         {
+            if (IsConnected)
+            {
                 if (IsOpen == false) OpenDevice(_deviceReadMode, _deviceWriteMode, _deviceShareMode);
                 try
                 {
@@ -323,6 +338,8 @@ namespace HidLibrary
                 {
                     return false;
                 }
+            }
+            return false;
         }
 
         public void Write(byte[] data, WriteCallback callback)
@@ -365,6 +382,25 @@ namespace HidLibrary
             writeReportDelegate.BeginInvoke(report, timeout, EndWriteReport, asyncState);
         }
 
+        /// <summary>
+        /// Handle data transfers on the control channel.  This method places data on the control channel for devices
+        /// that do not support the interupt transfers
+        /// </summary>
+        /// <param name="report">The outbound HID report</param>
+        /// <returns>The result of the tranfer request: true if successful otherwise false</returns>
+        /// 
+        public bool WriteReportSync(HidReport report)
+        {
+
+            if (null != report)
+            {
+                byte[] buffer = report.GetBytes();
+                return (NativeMethods.HidD_SetOutputReport(Handle, buffer, buffer.Length));
+            }
+            else
+                throw new ArgumentException("The output report is null, it must be allocated before you call this method", "report");
+        }
+
         public async Task<bool> WriteReportAsync(HidReport report, int timeout = 0)
         {
             var writeReportDelegate = new WriteReportDelegate(WriteReport);
@@ -392,7 +428,7 @@ namespace HidLibrary
                 if (IsOpen)
                     hidHandle = Handle;
                 else
-                    return false;
+                    hidHandle = OpenDeviceIO(_devicePath, NativeMethods.ACCESS_NONE);
 
                 //var overlapped = new NativeOverlapped();
                 success = NativeMethods.HidD_SetFeature(hidHandle, buffer, buffer.Length);
@@ -401,7 +437,11 @@ namespace HidLibrary
             {
                 throw new Exception(string.Format("Error accessing HID device '{0}'.", _devicePath), exception);
             }
-
+            finally
+            {
+                if (hidHandle != IntPtr.Zero && hidHandle != Handle)
+                    CloseDeviceIO(hidHandle);
+            }
             return success;
         }
 
@@ -547,58 +587,70 @@ namespace HidLibrary
         {
             var buffer = new byte[] { };
             var status = HidDeviceData.ReadStatus.NoDataRead;
+            IntPtr nonManagedBuffer;
 
             if (_deviceCapabilities.InputReportByteLength > 0)
             {
                 uint bytesRead = 0;
 
-                
+                buffer = CreateInputBuffer();
+                nonManagedBuffer = Marshal.AllocHGlobal(buffer.Length);
 
                 if (_deviceReadMode == DeviceMode.Overlapped)
                 {
-                    if (!reading)
-                    {
-                        read_buffer = CreateInputBuffer();
-                        var security = new NativeMethods.SECURITY_ATTRIBUTES();
-                        read_overlapped = new NativeOverlapped();
+                    var security = new NativeMethods.SECURITY_ATTRIBUTES();
+                    var overlapped = new NativeOverlapped();
+                    var overlapTimeout = timeout <= 0 ? NativeMethods.WAIT_INFINITE : timeout;
 
-                        security.lpSecurityDescriptor = IntPtr.Zero;
-                        security.bInheritHandle = true;
-                        security.nLength = Marshal.SizeOf(security);
+                    security.lpSecurityDescriptor = IntPtr.Zero;
+                    security.bInheritHandle = true;
+                    security.nLength = Marshal.SizeOf(security);
 
-                        read_overlapped.OffsetLow = 0;
-                        read_overlapped.OffsetHigh = 0;
-                        read_overlapped.EventHandle = NativeMethods.CreateEvent(ref security, Convert.ToInt32(false), Convert.ToInt32(true), string.Empty);
-                        NativeMethods.ReadFile(Handle, read_buffer, (uint)read_buffer.Length, out bytesRead, ref read_overlapped);
-                    }
+                    overlapped.OffsetLow = 0;
+                    overlapped.OffsetHigh = 0;
+                    overlapped.EventHandle = NativeMethods.CreateEvent(ref security, Convert.ToInt32(false), Convert.ToInt32(true), string.Empty);
 
                     try
                     {
-                        var result = NativeMethods.WaitForSingleObject(read_overlapped.EventHandle, timeout);
+                        var success = NativeMethods.ReadFile(Handle, nonManagedBuffer, (uint)buffer.Length, out bytesRead, ref overlapped);
 
-                        switch (result)
+                        if (success)
                         {
-                            case NativeMethods.WAIT_OBJECT_0: status = HidDeviceData.ReadStatus.Success; reading = false; CloseDeviceIO(read_overlapped.EventHandle); return new HidDeviceData(read_buffer, status);
-                            case NativeMethods.WAIT_TIMEOUT:
-                                status = HidDeviceData.ReadStatus.WaitTimedOut;
-                                buffer = new byte[] { };
-                                reading = true;
-                                break;
-                            case NativeMethods.WAIT_FAILED:
-                                status = HidDeviceData.ReadStatus.WaitFail;
-                                buffer = new byte[] { };
-                                reading = false;
-                                CloseDeviceIO(read_overlapped.EventHandle);
-                                break;
-                            default:
-                                status = HidDeviceData.ReadStatus.NoDataRead;
-                                buffer = new byte[] { };
-                                reading = false;
-                                CloseDeviceIO(read_overlapped.EventHandle);
-                                break;
+                            status = HidDeviceData.ReadStatus.Success; // No check here to see if bytesRead > 0 . Perhaps not necessary?
                         }
+                        else
+                        {
+                            var result = NativeMethods.WaitForSingleObject(overlapped.EventHandle, overlapTimeout);
+
+                            switch (result)
+                            {
+                                case NativeMethods.WAIT_OBJECT_0:
+                                    status = HidDeviceData.ReadStatus.Success;
+                                    NativeMethods.GetOverlappedResult(Handle, ref overlapped, out bytesRead, false);
+                                    break;
+                                case NativeMethods.WAIT_TIMEOUT:
+                                    status = HidDeviceData.ReadStatus.WaitTimedOut;
+                                    NativeMethods.CancelIo(Handle);
+                                    buffer = new byte[] { };
+                                    break;
+                                case NativeMethods.WAIT_FAILED:
+                                    status = HidDeviceData.ReadStatus.WaitFail;
+                                    buffer = new byte[] { };
+                                    break;
+                                default:
+                                    status = HidDeviceData.ReadStatus.NoDataRead;
+                                    buffer = new byte[] { };
+                                    break;
+                            }
+                        }
+                        Marshal.Copy(nonManagedBuffer, buffer, 0, (int)bytesRead);
                     }
-                    catch { status = HidDeviceData.ReadStatus.ReadError; reading = false; CloseDeviceIO(read_overlapped.EventHandle); }
+                    catch { status = HidDeviceData.ReadStatus.ReadError; }
+                    finally
+                    {
+                        CloseDeviceIO(overlapped.EventHandle);
+                        Marshal.FreeHGlobal(nonManagedBuffer);
+                    }
                 }
                 else
                 {
@@ -606,10 +658,12 @@ namespace HidLibrary
                     {
                         var overlapped = new NativeOverlapped();
 
-                        NativeMethods.ReadFile(Handle, buffer, (uint)buffer.Length, out bytesRead, ref overlapped);
+                        NativeMethods.ReadFile(Handle, nonManagedBuffer, (uint)buffer.Length, out bytesRead, ref overlapped);
                         status = HidDeviceData.ReadStatus.Success;
+                        Marshal.Copy(nonManagedBuffer, buffer, 0, (int)bytesRead);
                     }
                     catch { status = HidDeviceData.ReadStatus.ReadError; }
+                    finally { Marshal.FreeHGlobal(nonManagedBuffer); }
                 }
             }
             return new HidDeviceData(buffer, status);

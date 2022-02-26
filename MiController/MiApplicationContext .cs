@@ -1,25 +1,26 @@
 ﻿using MiController.Properties;
 using System;
-using System.ComponentModel;
 using System.Drawing;
-using System.Globalization;
 using System.Windows.Forms;
+using MiController.Win32;
+using Nefarius.ViGEm.Client.Exceptions;
 
 namespace MiController
 {
     public class MiApplicationContext : ApplicationContext
     {
         private readonly NotifyIcon _trayIcon;
-        private BackgroundWorker _backgroundWorker;
         private ContextMenuStrip _contextMenuStrip;
-        private ToolStripMenuItem _connectToolStripMenuItem;
-        private ToolStripMenuItem _disconnectToolStripMenuItem;
         private ToolStripMenuItem _statusToolStripMenuItem;
+        private const string XIAOMI_GAMEPAD_HARDWARE_FILTER = @"VID&00022717_PID&3144";
+        private XInputManager _manager;
+        private HidMonitor _monitor;
         public MiApplicationContext()
         {
-            InitBackgroundWorker();
+            AppDomain.CurrentDomain.UnhandledException += CurrentDomain_UnhandledException;
             InitContextMenu();
-
+            InitGamepad();
+            StartGamePad();
             // Initialize Tray Icon
             _trayIcon = new NotifyIcon   
             {
@@ -29,69 +30,33 @@ namespace MiController
             };
         }
 
+        private void CurrentDomain_UnhandledException(object sender, UnhandledExceptionEventArgs args)
+        {
+            var message = args.ExceptionObject is Exception exception ? exception.Message : args.ExceptionObject.ToString();
+            _statusToolStripMenuItem.Text = $"Error: {message}";
+        }
+
         private void exitToolStripMenuItem_Click(object sender, EventArgs e)
         {
-            _backgroundWorker.CancelAsync();
             _trayIcon.Visible = false;
-
+            _monitor.Stop();
             Application.Exit();
-        }
-
-        private void connectToolStripMenuItem_Click(object sender, EventArgs e)
-        {
-            StartStopProcess(true);
-            _backgroundWorker.RunWorkerAsync();
-        }
-        private void disconnectToolStripMenuItem_Click(object sender, EventArgs e)
-        {
-            _backgroundWorker.CancelAsync();
-        }
-
-        private void InitBackgroundWorker()
-        {
-            _backgroundWorker = new BackgroundWorker {WorkerReportsProgress = true, WorkerSupportsCancellation = true};
-            _backgroundWorker.DoWork += backgroundWorker_DoWork;
-            _backgroundWorker.ProgressChanged += backgroundWorker_ProgressChanged;
-            _backgroundWorker.RunWorkerCompleted += backgroundWorker_RunWorkerCompleted;
         }
 
         private void StartStopProcess(bool start)
         {
-            _connectToolStripMenuItem.Enabled = !start;
-            _disconnectToolStripMenuItem.Enabled = start;
+            _statusToolStripMenuItem.Image = start ? Resources.ConnectPlugged : Resources.ConnectUnplugged;
             _trayIcon.Icon = start ? Resources.MiLogo : Resources.MiLogoGrey;
         }
 
         private void InitContextMenu()
         {
-            _connectToolStripMenuItem = new ToolStripMenuItem
-            {
-                Name = "connectToolStripMenuItem",
-                Size = new Size(180, 22),
-                Text = "Connect",
-                Image = Resources.ConnectPlugged,
-                ImageTransparentColor = Color.Magenta
-            };
-            _connectToolStripMenuItem.Click += connectToolStripMenuItem_Click;
-
-            _disconnectToolStripMenuItem = new ToolStripMenuItem
-            {
-                Name = "disconnectToolStripMenuItem",
-                Size = new Size(180, 22),
-                Text = "Disconnect",
-                Image = Resources.ConnectUnplugged,
-                ImageTransparentColor = Color.Magenta,
-                Enabled = false
-            };
-            _disconnectToolStripMenuItem.Click += disconnectToolStripMenuItem_Click;
-            var toolStripSeparator1 = new ToolStripSeparator { Name = "toolStripSeparator1", Size = new Size(322, 6) };
-
             _statusToolStripMenuItem = new ToolStripMenuItem
             {
                 Name = "statusToolStripMenuItem",
                 Size = new Size(180, 22),
                 Text = "ready",
-                Enabled = false
+                Enabled = true
             };
 
             var toolStripSeparator2 = new ToolStripSeparator { Name = "toolStripSeparator2", Size = new Size(322, 6) };
@@ -107,58 +72,57 @@ namespace MiController
             exitToolStripMenuItem.Click += exitToolStripMenuItem_Click;
 
             _contextMenuStrip = new ContextMenuStrip { Renderer = new NoHighlightRenderer() };
-            _contextMenuStrip.Items.Add(_connectToolStripMenuItem);
-            _contextMenuStrip.Items.Add(_disconnectToolStripMenuItem);
-            _contextMenuStrip.Items.Add(toolStripSeparator1);
             _contextMenuStrip.Items.Add(_statusToolStripMenuItem);
             _contextMenuStrip.Items.Add(toolStripSeparator2);
             _contextMenuStrip.Items.Add(exitToolStripMenuItem);
         }
 
-        private void backgroundWorker_DoWork(object sender, DoWorkEventArgs e)
+
+        private void Manager_GamepadRunning(object sender, EventArgs eventArgs)
         {
-            var bw = sender as BackgroundWorker;
-
-            ControllerHelper.Run(bw);
-
-            if (bw != null)
-            {
-                if (bw.CancellationPending)
-                {
-                    e.Cancel = true;
-                }
-            }
+            _statusToolStripMenuItem.Text = "Gamepad connected";
+            StartStopProcess(true);
         }
 
-        private void backgroundWorker_RunWorkerCompleted(object sender, RunWorkerCompletedEventArgs e)
+        private void Manager_GamepadRemoved(object sender, EventArgs eventArgs)
         {
-            if (e.Cancelled)
-            {
-                _statusToolStripMenuItem.Text = "disconnected";
-            }
-            else if (e.Error != null)
-            {
-                string msg = String.Format(CultureInfo.InvariantCulture, "An error occurred: {0}", e.Error.Message);
-                _statusToolStripMenuItem.Text = msg;
-            }
+            _statusToolStripMenuItem.Text = "Gamepad disconnected";
             StartStopProcess(false);
         }
 
-        private void backgroundWorker_ProgressChanged(object sender, ProgressChangedEventArgs e)
+        private void Monitor_DeviceAttached(object sender, DeviceEventArgs e)
         {
-            _statusToolStripMenuItem.Text = (string)e.UserState;
+            //_statusToolStripMenuItem.Text = $"New HID device connected: {e.Description} {e.Path}";
+            _manager.AddAndStart(e.Path, e.InstanceId);
         }
 
-    }
-
-    internal class NoHighlightRenderer : ToolStripProfessionalRenderer
-    {
-        protected override void OnRenderMenuItemBackground(ToolStripItemRenderEventArgs e)
+        private void Monitor_DeviceRemoved(object sender, DeviceEventArgs e)
         {
-            if (e.Item.Enabled)
+            //_statusToolStripMenuItem.Text = $"HID device disconnected: {e.Description} {e.Path}";
+            _manager.StopAndRemove(e.Path);
+        }
+
+        private void InitGamepad()
+        {
+            try
             {
-                base.OnRenderMenuItemBackground(e);
+                _manager = new XInputManager();
+                _manager.GamepadRunning += Manager_GamepadRunning;
+                _manager.GamepadRemoved += Manager_GamepadRemoved;
             }
+            catch (VigemBusNotFoundException ex)
+            {
+                throw new ApplicationException("ViGEm Bus not found. Please make sure that is installed correctly", ex);
+            }
+
+            _monitor = new HidMonitor(XIAOMI_GAMEPAD_HARDWARE_FILTER);
+            _monitor.DeviceAttached += Monitor_DeviceAttached;
+            _monitor.DeviceRemoved += Monitor_DeviceRemoved;
+        }
+
+        private void StartGamePad()
+        {
+            _monitor.Start();
         }
     }
 }

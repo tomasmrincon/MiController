@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
 using System.Runtime.InteropServices;
+using System.Text;
 
 namespace HidLibrary
 {
@@ -32,8 +33,14 @@ namespace HidLibrary
 
         public static IEnumerable<HidDevice> Enumerate(int vendorId, params int[] productIds)
         {
-            return EnumerateDevices().Select(x => new HidDevice(x.Path, x.Description)).Where(x => x.Attributes.VendorId == vendorId && 
+            return EnumerateDevices().Select(x => new HidDevice(x.Path, x.Description)).Where(x => x.Attributes.VendorId == vendorId &&
                                                                                   productIds.Contains(x.Attributes.ProductId));
+        }
+
+        public static IEnumerable<HidDevice> Enumerate(int vendorId, int productId, ushort UsagePage)
+        {
+            return EnumerateDevices().Select(x => new HidDevice(x.Path, x.Description)).Where(x => x.Attributes.VendorId == vendorId &&
+                                                                                  productId == (ushort)x.Attributes.ProductId && (ushort)x.Capabilities.UsagePage == UsagePage);
         }
 
         public static IEnumerable<HidDevice> Enumerate(int vendorId)
@@ -41,13 +48,15 @@ namespace HidLibrary
             return EnumerateDevices().Select(x => new HidDevice(x.Path, x.Description)).Where(x => x.Attributes.VendorId == vendorId);
         }
 
-        private class DeviceInfo { public string Path { get; set; } public string Description { get; set; } }
+        public class DeviceInfo { public string Path { get; set; } public string Description { get; set; } public string InstanceID { get; set; } }
 
-        private static IEnumerable<DeviceInfo> EnumerateDevices()
+        public static IEnumerable<DeviceInfo> EnumerateDevices()
         {
             var devices = new List<DeviceInfo>();
             var hidClass = HidClassGuid;
             var deviceInfoSet = NativeMethods.SetupDiGetClassDevs(ref hidClass, null, 0, NativeMethods.DIGCF_PRESENT | NativeMethods.DIGCF_DEVICEINTERFACE);
+
+            var buf = new char[1024];
 
             if (deviceInfoSet.ToInt64() != NativeMethods.INVALID_HANDLE_VALUE)
             {
@@ -58,6 +67,9 @@ namespace HidLibrary
                 {
                     deviceIndex += 1;
 
+                    NativeMethods.SetupDiGetDeviceInstanceId(deviceInfoSet, ref deviceInfoData, buf, buf.Length, out var requiredSize);
+                    var instid = new string(buf, 0, requiredSize - 1);
+
                     var deviceInterfaceData = new NativeMethods.SP_DEVICE_INTERFACE_DATA();
                     deviceInterfaceData.cbSize = Marshal.SizeOf(deviceInterfaceData);
                     var deviceInterfaceIndex = 0;
@@ -66,9 +78,9 @@ namespace HidLibrary
                     {
                         deviceInterfaceIndex++;
                         var devicePath = GetDevicePath(deviceInfoSet, deviceInterfaceData);
-                        var description = GetBusReportedDeviceDescription(deviceInfoSet, ref deviceInfoData) ?? 
+                        var description = GetBusReportedDeviceDescription(deviceInfoSet, ref deviceInfoData) ??
                                           GetDeviceDescription(deviceInfoSet, ref deviceInfoData);
-                        devices.Add(new DeviceInfo { Path = devicePath, Description = description });
+                        devices.Add(new DeviceInfo { Path = devicePath, Description = description, InstanceID = instid });
                     }
                 }
                 NativeMethods.SetupDiDestroyDeviceInfoList(deviceInfoSet);
@@ -95,7 +107,7 @@ namespace HidLibrary
 
             NativeMethods.SetupDiGetDeviceInterfaceDetailBuffer(deviceInfoSet, ref deviceInterfaceData, IntPtr.Zero, 0, ref bufferSize, IntPtr.Zero);
 
-            return NativeMethods.SetupDiGetDeviceInterfaceDetail(deviceInfoSet, ref deviceInterfaceData, ref interfaceDetail, bufferSize, ref bufferSize, IntPtr.Zero) ? 
+            return NativeMethods.SetupDiGetDeviceInterfaceDetail(deviceInfoSet, ref deviceInterfaceData, ref interfaceDetail, bufferSize, ref bufferSize, IntPtr.Zero) ?
                 interfaceDetail.DevicePath : null;
         }
 
