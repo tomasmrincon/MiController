@@ -92,13 +92,11 @@ namespace MiController
 
         private void Monitor_DeviceAttached(object sender, DeviceEventArgs e)
         {
-            //_statusToolStripMenuItem.Text = $"New HID device connected: {e.Description} {e.Path}";
             _manager.AddAndStart(e.Path, e.InstanceId);
         }
 
         private void Monitor_DeviceRemoved(object sender, DeviceEventArgs e)
         {
-            //_statusToolStripMenuItem.Text = $"HID device disconnected: {e.Description} {e.Path}";
             _manager.StopAndRemove(e.Path);
         }
 
